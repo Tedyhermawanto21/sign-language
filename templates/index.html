@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign2Speech - Pengenalan Bahasa Isyarat</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <!-- Background Animation -->
+    <div class="bg-gradient"></div>
+    <div class="bg-blur"></div>
+    
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">🤟</span>
+                <h1>Sign<span class="highlight">2</span>Speech</h1>
+            </div>
+            <p class="tagline">Pengenalan Bahasa Isyarat Real-time dengan AI</p>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Video Section -->
+            <section class="video-section">
+                <div class="video-container">
+                    <div class="video-wrapper">
+                        <img id="videoFeed" src="/video_feed" alt="Webcam Feed" class="video-feed">
+                        <div class="video-overlay">
+                            <div class="recording-indicator">
+                                <span class="dot"></span>
+                                <span>LIVE</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Prediction Section -->
+            <section class="prediction-section">
+                <!-- Current Prediction -->
+                <div class="prediction-card glass">
+                    <div class="card-header">
+                        <span class="card-icon">🎯</span>
+                        <h3>Prediksi Saat Ini</h3>
+                    </div>
+                    <div class="prediction-content">
+                        <p id="currentPrediction" class="prediction-text">Menunggu gerakan...</p>
+                        <div class="confidence-bar">
+                            <div class="confidence-fill" id="confidenceFill"></div>
+                            <span class="confidence-text" id="confidenceText">0%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Final Result -->
+                <div class="result-card glass">
+                    <div class="card-header">
+                        <span class="card-icon">✨</span>
+                        <h3>Hasil Terakhir</h3>
+                    </div>
+                    <div class="result-content">
+                        <p id="finalResult" class="result-text">-</p>
+                        <button id="speakBtn" class="speak-btn" title="Ucapkan">
+                            🔊
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Lexicon Panel -->
+                <div class="lexicon-card glass">
+                    <div class="card-header">
+                        <span class="card-icon">📚</span>
+                        <h3>Frasa yang Didukung</h3>
+                    </div>
+                    <div class="lexicon-list">
+                        {% for phrase in lexicon %}
+                        <span class="lexicon-item" data-phrase="{{ phrase }}">{{ phrase }}</span>
+                        {% endfor %}
+                    </div>
+                </div>
+
+                <!-- History Panel -->
+                <div class="history-card glass">
+                    <div class="card-header">
+                        <span class="card-icon">📝</span>
+                        <h3>Riwayat</h3>
+                        <button id="clearHistory" class="clear-btn" title="Hapus Riwayat">🗑️</button>
+                    </div>
+                    <div id="historyList" class="history-list">
+                        <p class="empty-history">Belum ada riwayat</p>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>Dibuat dengan ❤️ menggunakan LSTM + Transformer AI</p>
+        </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
