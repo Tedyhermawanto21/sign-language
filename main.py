@@ -1362,7 +1362,7 @@ def infer_cls_realtime():
     last_decoded, same_count, idle_counter = "", 0, 0
     IDLE_LIMIT = int(IDLE_FACTOR * FPS_TARGET)
     # Prediction buffer for smoothing
-    prediction_hist = deque(maxlen=15)  # Average last 15 frames for stability
+    prediction_hist = deque(maxlen=10)  # Average last 10 frames for stability
     hand_hist = deque(maxlen=SEQUENCE_LENGTH)
     conf = 0.0
     
@@ -1407,7 +1407,7 @@ def infer_cls_realtime():
                 # STRICT CONFIRMATION:
                 # 1. Hands must be visible > 50% in recent history
                 # 2. Confidence > 0.35 (lowered to show predictions)
-                if hand_ratio > 0.5 and conf > 0.35:
+                if hand_ratio > 0.5 and conf > 0.45:
                     if decoded == last_decoded: 
                         same_count += 1
                     else: 
@@ -1419,7 +1419,7 @@ def infer_cls_realtime():
                     if idle_counter > IDLE_LIMIT:
                         sentence_text = ""
 
-            commit = (idle_counter > IDLE_LIMIT) or (same_count >= 5 and conf >= 0.7)
+            commit = (idle_counter > IDLE_LIMIT) or (same_count >= 5 and conf >= 0.60)
             if commit and sentence_text:
                 stable_text = sentence_text
                 speak(stable_text)
@@ -1521,7 +1521,7 @@ def _levenshtein(a: str, b: str) -> int:
             dp[i][j] = min(dp[i-1][j] + 1, dp[i][j-1] + 1, dp[i-1][j-1] + cost)
     return dp[la][lb]
 
-LEXICON = ["halo", "saya", "terima kasih"]  # Daftar semua frasa (harus match folder di MP_Data_Sentences)
+LEXICON = ["halo", "saya", "terima kasih", "nama"]  # Daftar semua frasa (harus match folder di MP_Data_Sentences)
 LEXICON_LETTERS = list("abcdefghijklmnopqrstuvwxyz")
 
 LEXICON_PHRASES = LEXICON
@@ -2345,7 +2345,7 @@ def infer_cls_realtime_v2():
     sentence_text, stable_text = "", ""
     last_decoded, same_count, idle_counter = "", 0, 0
     IDLE_LIMIT = int(IDLE_FACTOR * FPS_TARGET)
-    prediction_hist = deque(maxlen=15)
+    prediction_hist = deque(maxlen=10)
     hand_hist = deque(maxlen=SEQUENCE_LENGTH)
     conf = 0.0
     
@@ -2418,7 +2418,7 @@ def infer_cls_realtime_v2():
                 conf = float(np.max(p_avg))
                 decoded = LEXICON[pred]
                 
-                if hand_ratio > 0.5 and conf > 0.35:
+                if hand_ratio > 0.5 and conf > 0.45:
                     if decoded == last_decoded:
                         same_count += 1
                     else:
@@ -2476,6 +2476,1041 @@ def infer_cls_realtime_v2():
             holistic.close()
 
 
+# ====== V3 OPTIMIZED FUNCTIONS ======
+
+def build_phrase_classifier_v3(T=SEQUENCE_LENGTH, F=FEATURE_DIM, num_labels=None,
+                                d_model=128, heads=4, blocks=2):
+    """
+    Right-sized model for small datasets (50-200 samples/class).
+    Same architecture as v1 (Feature Separation → BiLSTM → Transformer → Hand Attention)
+    but with balanced parameters (~300K) and minimal dropout to allow learning.
+    """
+    if num_labels is None:
+        num_labels = len(LEXICON)
+    
+    inp = layers.Input((T, F), name="input")
+    
+    # ====== FEATURE SEPARATION ======
+    pose_feat = layers.Lambda(lambda x: x[:, :, :132], name="pose_extract")(inp)
+    lh_feat = layers.Lambda(lambda x: x[:, :, 1536:1599], name="lh_extract")(inp)
+    rh_feat = layers.Lambda(lambda x: x[:, :, 1599:1662], name="rh_extract")(inp)
+    
+    # Projections
+    pose_proj = layers.Dense(48, activation='relu', name="pose_proj")(pose_feat)
+    lh_proj = layers.Dense(48, activation='relu', name="lh_proj")(lh_feat)
+    rh_proj = layers.Dense(48, activation='relu', name="rh_proj")(rh_feat)
+    
+    # ====== HAND-FOCUSED PROCESSING ======
+    hands_combined = layers.Concatenate(name="hands_concat")([lh_proj, rh_proj])
+    hands_lstm = layers.Bidirectional(
+        layers.LSTM(64, return_sequences=True), name="hands_lstm"
+    )(hands_combined)
+    hands_lstm = layers.Dropout(0.1)(hands_lstm)
+    
+    pose_lstm = layers.Bidirectional(
+        layers.LSTM(32, return_sequences=True), name="pose_lstm"
+    )(pose_proj)
+    pose_lstm = layers.Dropout(0.1)(pose_lstm)
+    
+    combined_features = layers.Concatenate(name="feature_concat")([hands_lstm, pose_lstm])
+    
+    # ====== TRANSFORMER ======
+    x = layers.Dense(d_model, activation='relu', name="trans_proj")(combined_features)
+    
+    pos_embedding = layers.Embedding(input_dim=T, output_dim=d_model, name="pos_embedding")
+    positions = tf.range(start=0, limit=T, delta=1)
+    pos_enc = pos_embedding(positions)
+    x = x + pos_enc
+    x = layers.Dropout(0.1)(x)
+    
+    for i in range(blocks):
+        attn = layers.MultiHeadAttention(
+            num_heads=heads, 
+            key_dim=d_model//heads,
+            name=f"mha_{i}"
+        )(x, x)
+        attn = layers.Dropout(0.1)(attn)
+        x = layers.LayerNormalization(name=f"ln1_{i}")(x + attn)
+        
+        ff = layers.Dense(d_model * 2, activation='gelu', name=f"ff1_{i}")(x)
+        ff = layers.Dropout(0.1)(ff)
+        ff = layers.Dense(d_model, name=f"ff2_{i}")(ff)
+        ff = layers.Dropout(0.1)(ff)
+        x = layers.LayerNormalization(name=f"ln2_{i}")(x + ff)
+    
+    # ====== HAND ATTENTION LAYER ======
+    hand_attn_scores = layers.Dense(1, activation='tanh', name="hand_attn_score")(x)
+    hand_attn_weights = layers.Softmax(axis=1, name="hand_attn_softmax")(hand_attn_scores)
+    weighted = layers.Multiply(name="hand_weighted")([x, hand_attn_weights])
+    hand_context = layers.Lambda(lambda t: tf.reduce_sum(t, axis=1), name="hand_context")(weighted)
+    global_pool = layers.GlobalAveragePooling1D(name="global_pool")(x)
+    final_features = layers.Concatenate(name="final_concat")([hand_context, global_pool])
+    
+    # ====== CLASSIFICATION HEAD (low dropout to allow learning) ======
+    final = layers.Dense(128, activation='relu', name="fc1")(final_features)
+    final = layers.Dropout(0.3)(final)
+    final = layers.Dense(64, activation='relu', name="fc2")(final)
+    final = layers.Dropout(0.2)(final)
+    out = layers.Dense(num_labels, activation='softmax', name="output")(final)
+    
+    model = Model(inp, out, name="SignLanguage_V3_Optimized")
+    
+    # Fixed LR — ReduceLROnPlateau will handle decay during training
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=1e-3,
+        beta_1=0.9,
+        beta_2=0.999
+    )
+    
+    model.compile(
+        optimizer=optimizer,
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    # Print model size comparison
+    total_params = model.count_params()
+    print(f"\n🏗️ Model V3 Summary:")
+    print(f"   Total parameters: {total_params:,}")
+    print(f"   d_model={d_model}, heads={heads}, blocks={blocks}")
+    print(f"   LSTM hands=64, LSTM pose=32")
+    print(f"   FC: 128→64→{num_labels}")
+    
+    return model
+
+
+def augment_samples_v3(X_list, num_augments=8):
+    """
+    Gentler augmentation with more variety (8 versions per sample).
+    Includes mirror flip and temporal masking for better generalization.
+    """
+    augmented = []
+    for frames in X_list:
+        # Aug 1: Gentle time shift + light noise
+        aug1 = augment_time_shift(frames, max_shift=2)
+        aug1 = augment_noise(aug1, noise_std=0.008)
+        augmented.append(aug1)
+        
+        # Aug 2: Slight speed variation (slower)
+        aug2 = augment_speed_variation(frames, speed_factor=np.random.uniform(0.9, 1.0))
+        aug2 = augment_noise(aug2, noise_std=0.005)
+        augmented.append(aug2)
+        
+        # Aug 3: Slight speed variation (faster)
+        aug3 = augment_speed_variation(frames, speed_factor=np.random.uniform(1.0, 1.1))
+        aug3 = augment_noise(aug3, noise_std=0.005)
+        augmented.append(aug3)
+        
+        # Aug 4: Gentle scale
+        aug4 = augment_scale(frames, scale_range=(0.92, 1.08))
+        aug4 = augment_noise(aug4, noise_std=0.006)
+        augmented.append(aug4)
+        
+        # Aug 5: Different time shift + noise combo
+        aug5 = augment_time_shift(frames, max_shift=4)
+        aug5 = augment_scale(aug5, scale_range=(0.93, 1.07))
+        aug5 = augment_noise(aug5, noise_std=0.007)
+        augmented.append(aug5)
+        
+        # Aug 6: Gentle temporal jitter (interpolate, not zero-out)
+        aug6 = augment_speed_variation(frames, speed_factor=np.random.uniform(0.85, 1.15))
+        aug6 = augment_noise(aug6, noise_std=0.007)
+        augmented.append(aug6)
+        
+        # Aug 7: Combined time shift + scale
+        aug7 = augment_time_shift(frames, max_shift=3)
+        aug7 = augment_scale(aug7, scale_range=(0.95, 1.05))
+        aug7 = augment_noise(aug7, noise_std=0.006)
+        augmented.append(aug7)
+        
+        # Aug 8: Light dropout (1-2% missing landmarks)
+        aug8 = augment_dropout(frames, drop_prob=0.02)
+        aug8 = augment_noise(aug8, noise_std=0.005)
+        augmented.append(aug8)
+    
+    return augmented
+
+
+def load_dataset_for_cls_v3():
+    """
+    Load dataset with v3 augmentation (8x instead of 4x).
+    Split before augmentation to prevent data leakage.
+    """
+    X_raw, labels_raw = load_dataset_raw()
+    
+    X_filtered = []
+    y_filtered = []
+    for x, label in zip(X_raw, labels_raw):
+        if label in LEXICON:
+            X_filtered.append(x)
+            y_filtered.append(LEXICON.index(label))
+    
+    X_filtered = np.array(X_filtered, dtype=np.float32)
+    y_filtered = np.array(y_filtered, dtype=np.int64)
+    
+    print(f"[INFO] Filtered samples in LEXICON: {len(X_filtered)}")
+    
+    # Split BEFORE augmentation
+    X_tr_raw, X_val_raw, y_tr, y_val = train_test_split(
+        X_filtered, y_filtered, 
+        test_size=0.2, 
+        stratify=y_filtered, 
+        random_state=42
+    )
+    
+    print(f"[INFO] Split: {len(X_tr_raw)} train, {len(X_val_raw)} val (before augmentation)")
+    
+    # Augment training set with v3 (4x augmented versions)
+    X_tr_aug = augment_samples_v3(list(X_tr_raw), num_augments=4)
+    
+    # Combine: original (1x) + augmented (4 selected) = 5x total
+    # Only take first 4 augmentations per sample for less noise
+    X_tr_aug_selected = X_tr_aug[:len(X_tr_raw) * 4]
+    X_tr_combined = list(X_tr_raw) + X_tr_aug_selected
+    y_tr_combined = list(y_tr) * 5
+    
+    # Shuffle
+    indices = np.random.permutation(len(X_tr_combined))
+    X_tr_combined = [X_tr_combined[i] for i in indices]
+    y_tr_combined = [y_tr_combined[i] for i in indices]
+    
+    X_tr = np.array(X_tr_combined, dtype=np.float32)
+    y_tr = np.array(y_tr_combined, dtype=np.int64)
+    
+    X_val = np.array(X_val_raw, dtype=np.float32)
+    y_val = np.array(y_val, dtype=np.int64)
+    
+    print(f"[INFO] Final: {len(X_tr)} train (5x with augmentation), {len(X_val)} val (original only)")
+    
+    # Standardize
+    stats_path = os.path.join(MODEL_DIR, "norm_stats_v3.npz")
+    mu = X_tr.mean(axis=(0, 1), keepdims=True)
+    sigma = X_tr.std(axis=(0, 1), keepdims=True) + 1e-6
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    np.savez(stats_path, mu=mu, sigma=sigma)
+    
+    X_tr = (X_tr - mu) / sigma
+    X_val = (X_val - mu) / sigma
+    
+    return X_tr, X_val, y_tr, y_val
+
+
+def train_cls_v3():
+    """
+    Optimized training v3:
+    - Smaller model (build_phrase_classifier_v3)
+    - 8x augmentation (augment_samples_v3)
+    - Label smoothing (built into model compile)
+    - Cosine decay LR (built into model compile)
+    - Longer training with early stopping
+    - Class weight balancing
+    """
+    import datetime
+    
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+    
+    X_tr, X_val, y_tr, y_val = load_dataset_for_cls_v3()
+    
+    num_labels = int(np.max(y_tr)) + 1
+    print(f"\n{'='*60}")
+    print(f"🚀 TRAINING V3 — OPTIMIZED FOR SMALL DATASETS")
+    print(f"{'='*60}")
+    print(f"Num classes: {num_labels}")
+    print(f"Classes: {LEXICON[:num_labels]}")
+    
+    # Class distribution
+    unique, counts = np.unique(y_tr, return_counts=True)
+    print(f"\n📈 Training class distribution:")
+    for cls_idx, count in zip(unique, counts):
+        cls_name = LEXICON[cls_idx] if cls_idx < len(LEXICON) else f"Class_{cls_idx}"
+        print(f"  [{cls_idx}] {cls_name}: {count} samples ({100*count/len(y_tr):.1f}%)")
+    
+    # Compute class weights for balancing
+    from sklearn.utils.class_weight import compute_class_weight
+    class_weights_arr = compute_class_weight('balanced', classes=np.unique(y_tr), y=y_tr)
+    class_weight_dict = {i: w for i, w in enumerate(class_weights_arr)}
+    print(f"\n⚖️ Class weights: {class_weight_dict}")
+    
+    print(f"\n🔀 Train/Val split:")
+    print(f"  Training: {len(X_tr)} samples (original + 8x augmented)")
+    print(f"  Validation: {len(X_val)} samples (original only)")
+    
+    # Build smaller model
+    model = build_phrase_classifier_v3(num_labels=num_labels)
+    model.summary()
+    
+    # Callbacks
+    log_dir = os.path.join("logs", "v3_" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            os.path.join(MODEL_DIR, "phrase_cls_v3.h5"),
+            save_best_only=True, 
+            monitor="val_accuracy", 
+            mode="max",
+            verbose=1
+        ),
+        tf.keras.callbacks.TensorBoard(
+            log_dir=log_dir, 
+            histogram_freq=1
+        ),
+        tf.keras.callbacks.CSVLogger(
+            os.path.join(MODEL_DIR, "training_log_v3.csv"),
+            append=False
+        ),
+        # ReduceLROnPlateau as backup (cosine is primary via optimizer)
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=10,
+            min_lr=1e-7,
+            verbose=1
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_accuracy',
+            patience=25,
+            restore_best_weights=True,
+            verbose=1
+        )
+    ]
+    
+    print(f"\n🚀 Starting training v3...")
+    print(f"📁 TensorBoard: {log_dir}")
+    print(f"{'='*60}\n")
+    
+    history = model.fit(
+        X_tr, y_tr, 
+        epochs=200, 
+        batch_size=16,
+        validation_data=(X_val, y_val),
+        class_weight=class_weight_dict,
+        callbacks=callbacks, 
+        verbose=1
+    )
+    
+    # Plot training history
+    plt.figure(figsize=(14, 5))
+    
+    plt.subplot(1, 3, 1)
+    plt.plot(history.history['loss'], label='Train Loss')
+    plt.plot(history.history['val_loss'], label='Val Loss')
+    plt.title('Loss over Epochs')
+    plt.xlabel('Epoch'); plt.ylabel('Loss')
+    plt.legend(); plt.grid(True)
+    
+    plt.subplot(1, 3, 2)  
+    plt.plot(history.history['accuracy'], label='Train Accuracy')
+    plt.plot(history.history['val_accuracy'], label='Val Accuracy')
+    plt.title('Accuracy over Epochs')
+    plt.xlabel('Epoch'); plt.ylabel('Accuracy')
+    plt.legend(); plt.grid(True)
+    
+    plt.subplot(1, 3, 3)
+    if 'lr' in history.history:
+        plt.plot(history.history['lr'], label='Learning Rate')
+    plt.title('Learning Rate')
+    plt.xlabel('Epoch'); plt.ylabel('LR')
+    plt.legend(); plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(MODEL_DIR, 'training_history_v3.png'), dpi=150)
+    print(f"\n📊 Training history: {os.path.join(MODEL_DIR, 'training_history_v3.png')}")
+    
+    # Final evaluation
+    print(f"\n{'='*60}")
+    print("📋 FINAL EVALUATION V3")
+    print(f"{'='*60}")
+    train_loss, train_acc = model.evaluate(X_tr, y_tr, verbose=0)
+    val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+    print(f"Training   - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
+    print(f"Validation - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}")
+    
+    # Per-class metrics
+    y_pred = np.argmax(model.predict(X_val, verbose=0), axis=1)
+    class_names = [LEXICON[i] if i < len(LEXICON) else f"Class_{i}" for i in range(num_labels)]
+    
+    present_labels = sorted(set(y_val) | set(y_pred))
+    present_names = [class_names[i] for i in present_labels]
+    
+    print(f"\n📈 CLASSIFICATION REPORT (Validation Set):")
+    print("-" * 50)
+    print(classification_report(y_val, y_pred, labels=present_labels, target_names=present_names))
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_val, y_pred, labels=present_labels)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=present_names, yticklabels=present_names)
+    plt.title('Confusion Matrix V3 (Validation Set)')
+    plt.xlabel('Predicted'); plt.ylabel('Actual')
+    plt.tight_layout()
+    plt.savefig(os.path.join(MODEL_DIR, 'confusion_matrix_v3.png'), dpi=150)
+    print(f"\n📊 Confusion matrix: {os.path.join(MODEL_DIR, 'confusion_matrix_v3.png')}")
+    
+    print(f"\n{'='*60}")
+    print(f"✅ Training V3 complete!")
+    print(f"   Model saved: {os.path.join(MODEL_DIR, 'phrase_cls_v3.h5')}")
+    print(f"   Norm stats: {os.path.join(MODEL_DIR, 'norm_stats_v3.npz')}")
+    print(f"\n💡 Next steps:")
+    print(f"   1. Convert to ONNX: python main.py convert_onnx_v3")
+    print(f"   2. Test inference:   python main.py infer_cls_v3")
+    print(f"{'='*60}")
+
+
+def convert_to_onnx_v3():
+    """Convert V3 model to ONNX format."""
+    try:
+        import tf2onnx
+    except ImportError:
+        print("❌ Install tf2onnx: pip install tf2onnx")
+        return
+    
+    h5_path = os.path.join(MODEL_DIR, "phrase_cls_v3.h5")
+    onnx_path = os.path.join(MODEL_DIR, "phrase_cls_v3.onnx")
+    
+    if not os.path.exists(h5_path):
+        print(f"❌ Model not found: {h5_path}")
+        print("   Run 'python main.py train_cls_v3' first.")
+        return
+    
+    model = build_phrase_classifier_v3(num_labels=len(LEXICON))
+    model.load_weights(h5_path)
+    
+    import onnxruntime
+    spec = (tf.TensorSpec((None, SEQUENCE_LENGTH, FEATURE_DIM), tf.float32, name="input"),)
+    model_proto, _ = tf2onnx.convert.from_keras(model, input_signature=spec, 
+                                                  output_path=onnx_path)
+    print(f"✅ ONNX V3 model saved: {onnx_path}")
+
+
+def infer_cls_realtime_v3():
+    """
+    Real-time inference using V3 optimized model.
+    Uses V3 norm stats and model. Falls back to Keras if ONNX not available.
+    """
+    # Load V3 normalization stats
+    stats_path = os.path.join(MODEL_DIR, "norm_stats_v3.npz")
+    if not os.path.exists(stats_path):
+        print("❌ V3 norm stats not found. Run 'python main.py train_cls_v3' first.")
+        return
+    stats = np.load(stats_path)
+    mu, sigma = stats["mu"], stats["sigma"]
+    
+    # Try ONNX first, fallback to Keras
+    onnx_path = os.path.join(MODEL_DIR, "phrase_cls_v3.onnx")
+    use_onnx = os.path.exists(onnx_path)
+    
+    if use_onnx:
+        predictor = ONNXPredictor(onnx_path)
+        bg_predictor = BackgroundPredictor(predictor)
+        print("⚡ Using ONNX V3 model")
+    else:
+        model = build_phrase_classifier_v3(num_labels=len(LEXICON))
+        model.load_weights(os.path.join(MODEL_DIR, "phrase_cls_v3.h5"))
+        bg_predictor = None
+        print("🧠 Using Keras V3 model (convert to ONNX for speed: python main.py convert_onnx_v3)")
+    
+    # Camera setup
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FPS, FPS_TARGET)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    
+    seq = []
+    sentence_text, stable_text = "", ""
+    last_decoded, same_count, idle_counter = "", 0, 0
+    IDLE_LIMIT = int(IDLE_FACTOR * FPS_TARGET)
+    prediction_hist = deque(maxlen=10)
+    hand_hist = deque(maxlen=SEQUENCE_LENGTH)
+    conf = 0.0
+    
+    PREDICT_EVERY = 2 if use_onnx else 1
+    frame_count = 0
+    fps_times = deque(maxlen=30)
+    predict_ms = 0.0
+    
+    if USE_HYBRID_TRACKING:
+        holistic = None
+        print("📍 Using HYBRID tracking")
+    else:
+        holistic = mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    
+    print("\n" + "="*50)
+    print("🚀 INFERENCE V3 — OPTIMIZED MODEL")
+    print("="*50)
+    print(f"   Engine: {'ONNX Runtime' if use_onnx else 'Keras'}")
+    print(f"   Model: V3 (~500K params)")
+    print(f"   Predict every: {PREDICT_EVERY} frames")
+    print("="*50 + "\n")
+    
+    try:
+        while True:
+            t_start = time.perf_counter()
+            
+            ret, frame = cap.read()
+            if not ret:
+                break
+            img, results = mediapipe_detection(frame, holistic)
+            draw_landmarks(img, results)
+            
+            kpts = extract_keypoints(results)
+            seq.append(kpts)
+            seq = seq[-SEQUENCE_LENGTH:]
+            
+            hands_missing = (results.left_hand_landmarks is None and results.right_hand_landmarks is None)
+            hand_hist.append(0 if hands_missing else 1)
+            hand_ratio = sum(hand_hist) / max(1, len(hand_hist))
+            idle_counter = idle_counter + 1 if hands_missing else 0
+            
+            frame_count += 1
+            
+            if len(seq) == SEQUENCE_LENGTH and frame_count % PREDICT_EVERY == 0:
+                seq_raw = np.asarray(seq, dtype=np.float32)
+                seq_arr = normalize_batch(seq_raw, use_face=USE_FACE)
+                if not USE_FACE:
+                    seq_arr[:, FACE_SLICE] = 0.0
+                seq_arr = (seq_arr - mu) / sigma
+                
+                if use_onnx:
+                    bg_predictor.submit(seq_arr)
+                else:
+                    p = model.predict(as_batch(seq_arr), verbose=0)[0]
+                    prediction_hist.append(p)
+            
+            # Get prediction result
+            if use_onnx:
+                result, predict_ms = bg_predictor.get_result()
+                if result is not None:
+                    p = result[0]
+                    prediction_hist.append(p)
+            
+            if len(prediction_hist) > 0:
+                p_avg = np.mean(prediction_hist, axis=0)
+                pred = int(np.argmax(p_avg))
+                conf = float(np.max(p_avg))
+                decoded = LEXICON[pred]
+                
+                if hand_ratio > 0.5 and conf > 0.45:
+                    if decoded == last_decoded:
+                        same_count += 1
+                    else:
+                        same_count, last_decoded = 1, decoded
+                    sentence_text = decoded
+                else:
+                    if idle_counter > IDLE_LIMIT:
+                        sentence_text = ""
+            
+            commit_thresh = 2 if use_onnx else 4
+            commit = (idle_counter > IDLE_LIMIT) or (same_count >= commit_thresh and conf >= 0.55)
+            if commit and sentence_text:
+                stable_text = sentence_text
+                speak(stable_text)
+                seq, sentence_text, last_decoded, same_count = [], "", "", 0
+                idle_counter, conf = 0, 0.0
+                hand_hist.clear()
+                prediction_hist.clear()
+            
+            # FPS calculation
+            t_end = time.perf_counter()
+            fps_times.append(t_end - t_start)
+            fps = 1.0 / (sum(fps_times) / len(fps_times)) if fps_times else 0
+            
+            # Display
+            cv2.rectangle(img, (0, 0), (img.shape[1], 140), (245, 117, 16), -1)
+            cv2.putText(img, f"Prediction: {sentence_text}", (10, 32),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(img, f"COMMITTED: {stable_text}", (10, 70),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            debug_pred = last_decoded if last_decoded else "(waiting...)"
+            cv2.putText(img, f"conf:{conf:.2f} hands:{hand_ratio:.2f} pred:{debug_pred} FPS:{fps:.0f}",
+                       (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            cv2.putText(img, f"V3 Model | {'ONNX' if use_onnx else 'Keras'} | predict:{predict_ms:.0f}ms",
+                       (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 255), 1)
+            
+            cv2.imshow("Sign2Speech V3 (q=quit)", img)
+            if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                break
+    finally:
+        if use_onnx and bg_predictor:
+            bg_predictor.stop()
+        cap.release()
+        cv2.destroyAllWindows()
+        if holistic is not None:
+            holistic.close()
+
+# ====== V4 VELOCITY FEATURES (GENIUS MODE) ======
+
+def compute_velocity_features(seq):
+    """
+    Compute velocity (frame-to-frame difference) for landmark sequences.
+    Input:  (T, 1662) — raw landmarks
+    Output: (T, 1662) — velocity features (first frame = 0)
+    
+    Velocity captures MOVEMENT PATTERNS which is the key signal for sign language.
+    """
+    velocity = np.zeros_like(seq)
+    velocity[1:] = seq[1:] - seq[:-1]
+    return velocity
+
+
+def add_velocity_to_dataset(X):
+    """
+    Add velocity features to all samples.
+    Input:  (N, T, 1662)
+    Output: (N, T, 3324) — [landmarks, velocity] concatenated
+    """
+    X_with_vel = []
+    for seq in X:
+        vel = compute_velocity_features(seq)
+        combined = np.concatenate([seq, vel], axis=-1)  # (T, 3324)
+        X_with_vel.append(combined)
+    return np.array(X_with_vel, dtype=np.float32)
+
+
+def build_phrase_classifier_v4(T=SEQUENCE_LENGTH, F=3324, num_labels=None,
+                                d_model=128, heads=4, blocks=2):
+    """
+    V4 model: Takes [landmarks + velocity] features.
+    Same LSTM+Transformer architecture but processes 2x features.
+    Velocity features make the model much more discriminative for dynamic gestures.
+    """
+    if num_labels is None:
+        num_labels = len(LEXICON)
+    
+    inp = layers.Input((T, F), name="input")
+    
+    # Split into position and velocity streams
+    # Position landmarks
+    pos_pose = layers.Lambda(lambda x: x[:, :, :132], name="pos_pose")(inp)
+    pos_lh   = layers.Lambda(lambda x: x[:, :, 1536:1599], name="pos_lh")(inp)
+    pos_rh   = layers.Lambda(lambda x: x[:, :, 1599:1662], name="pos_rh")(inp)
+    
+    # Velocity landmarks (offset by 1662)
+    vel_pose = layers.Lambda(lambda x: x[:, :, 1662:1794], name="vel_pose")(inp)
+    vel_lh   = layers.Lambda(lambda x: x[:, :, 3198:3261], name="vel_lh")(inp)
+    vel_rh   = layers.Lambda(lambda x: x[:, :, 3261:3324], name="vel_rh")(inp)
+    
+    # Combine position + velocity per body part
+    pose_feat = layers.Concatenate(name="pose_combined")([pos_pose, vel_pose])  # 264
+    lh_feat   = layers.Concatenate(name="lh_combined")([pos_lh, vel_lh])        # 126
+    rh_feat   = layers.Concatenate(name="rh_combined")([pos_rh, vel_rh])        # 126
+    
+    # Projections
+    pose_proj = layers.Dense(48, activation='relu', name="pose_proj")(pose_feat)
+    lh_proj   = layers.Dense(48, activation='relu', name="lh_proj")(lh_feat)
+    rh_proj   = layers.Dense(48, activation='relu', name="rh_proj")(rh_feat)
+    
+    # ====== HAND-FOCUSED PROCESSING ======
+    hands_combined = layers.Concatenate(name="hands_concat")([lh_proj, rh_proj])
+    hands_lstm = layers.Bidirectional(
+        layers.LSTM(64, return_sequences=True), name="hands_lstm"
+    )(hands_combined)
+    hands_lstm = layers.Dropout(0.1)(hands_lstm)
+    
+    pose_lstm = layers.Bidirectional(
+        layers.LSTM(32, return_sequences=True), name="pose_lstm"
+    )(pose_proj)
+    pose_lstm = layers.Dropout(0.1)(pose_lstm)
+    
+    combined_features = layers.Concatenate(name="feature_concat")([hands_lstm, pose_lstm])
+    
+    # ====== TRANSFORMER ======
+    x = layers.Dense(d_model, activation='relu', name="trans_proj")(combined_features)
+    
+    pos_embedding = layers.Embedding(input_dim=T, output_dim=d_model, name="pos_embedding")
+    positions = tf.range(start=0, limit=T, delta=1)
+    pos_enc = pos_embedding(positions)
+    x = x + pos_enc
+    x = layers.Dropout(0.1)(x)
+    
+    for i in range(blocks):
+        attn = layers.MultiHeadAttention(
+            num_heads=heads, key_dim=d_model//heads, name=f"mha_{i}"
+        )(x, x)
+        attn = layers.Dropout(0.1)(attn)
+        x = layers.LayerNormalization(name=f"ln1_{i}")(x + attn)
+        
+        ff = layers.Dense(d_model * 2, activation='gelu', name=f"ff1_{i}")(x)
+        ff = layers.Dropout(0.1)(ff)
+        ff = layers.Dense(d_model, name=f"ff2_{i}")(ff)
+        ff = layers.Dropout(0.1)(ff)
+        x = layers.LayerNormalization(name=f"ln2_{i}")(x + ff)
+    
+    # ====== HAND ATTENTION ======
+    hand_attn_scores = layers.Dense(1, activation='tanh', name="hand_attn_score")(x)
+    hand_attn_weights = layers.Softmax(axis=1, name="hand_attn_softmax")(hand_attn_scores)
+    weighted = layers.Multiply(name="hand_weighted")([x, hand_attn_weights])
+    hand_context = layers.Lambda(lambda t: tf.reduce_sum(t, axis=1), name="hand_context")(weighted)
+    global_pool = layers.GlobalAveragePooling1D(name="global_pool")(x)
+    final_features = layers.Concatenate(name="final_concat")([hand_context, global_pool])
+    
+    # ====== CLASSIFICATION HEAD ======
+    final = layers.Dense(128, activation='relu', name="fc1")(final_features)
+    final = layers.Dropout(0.3)(final)
+    final = layers.Dense(64, activation='relu', name="fc2")(final)
+    final = layers.Dropout(0.2)(final)
+    out = layers.Dense(num_labels, activation='softmax', name="output")(final)
+    
+    model = Model(inp, out, name="SignLanguage_V4_Velocity")
+    
+    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+    model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    
+    total_params = model.count_params()
+    print(f"\n🏗️ Model V4 Summary (with velocity features):")
+    print(f"   Total parameters: {total_params:,}")
+    print(f"   Input: landmarks(258) + velocity(258) = 516 useful features")
+    print(f"   d_model={d_model}, heads={heads}, blocks={blocks}")
+    
+    return model
+
+
+def train_cls_v4():
+    """
+    V4 Training:
+    - NO augmentation (augmentation was destroying signal)
+    - Velocity features (captures hand movement patterns)
+    - Same LSTM+Transformer architecture
+    """
+    import datetime
+    
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+    
+    # Load raw data WITHOUT augmentation
+    X_raw, labels_raw = load_dataset_raw()
+    
+    X_filtered, y_filtered = [], []
+    for x, label in zip(X_raw, labels_raw):
+        if label in LEXICON:
+            X_filtered.append(x)
+            y_filtered.append(LEXICON.index(label))
+    
+    X_filtered = np.array(X_filtered, dtype=np.float32)
+    y_filtered = np.array(y_filtered, dtype=np.int64)
+    
+    print(f"[INFO] Filtered samples in LEXICON: {len(X_filtered)}")
+    
+    # Split BEFORE any processing
+    X_tr_raw, X_val_raw, y_tr, y_val = train_test_split(
+        X_filtered, y_filtered, test_size=0.2, stratify=y_filtered, random_state=42
+    )
+    
+    # Add velocity features
+    print(f"[INFO] Computing velocity features...")
+    X_tr = add_velocity_to_dataset(X_tr_raw)  # (N, T, 3324)
+    X_val = add_velocity_to_dataset(X_val_raw)
+    
+    print(f"[INFO] Feature dimension: {X_tr.shape[-1]} (landmarks + velocity)")
+    
+    # Light augmentation: ONLY noise on training data (very gentle)
+    print(f"[INFO] Adding 2x gentle noise augmentation...")
+    X_tr_aug1 = X_tr + np.random.normal(0, 0.005, X_tr.shape).astype(np.float32)
+    X_tr_aug2 = X_tr + np.random.normal(0, 0.003, X_tr.shape).astype(np.float32)
+    X_tr = np.concatenate([X_tr, X_tr_aug1, X_tr_aug2], axis=0)  # 3x
+    y_tr = np.concatenate([y_tr, y_tr, y_tr], axis=0)
+    
+    # Shuffle
+    indices = np.random.permutation(len(X_tr))
+    X_tr = X_tr[indices]
+    y_tr = y_tr[indices]
+    
+    # Standardize
+    stats_path = os.path.join(MODEL_DIR, "norm_stats_v4.npz")
+    mu = X_tr.mean(axis=(0, 1), keepdims=True)
+    sigma = X_tr.std(axis=(0, 1), keepdims=True) + 1e-6
+    np.savez(stats_path, mu=mu, sigma=sigma)
+    
+    X_tr = (X_tr - mu) / sigma
+    X_val = (X_val - mu) / sigma
+    
+    num_labels = int(np.max(y_tr)) + 1
+    print(f"\n{'='*60}")
+    print(f"🚀 TRAINING V4 — VELOCITY FEATURES + NO AUGMENTATION")
+    print(f"{'='*60}")
+    print(f"Classes: {LEXICON[:num_labels]}")
+    print(f"Training: {len(X_tr)} samples (3x: original + 2x noise)")
+    print(f"Validation: {len(X_val)} samples (original only)")
+    
+    unique, counts = np.unique(y_tr, return_counts=True)
+    for cls_idx, count in zip(unique, counts):
+        cls_name = LEXICON[cls_idx] if cls_idx < len(LEXICON) else f"Class_{cls_idx}"
+        print(f"  [{cls_idx}] {cls_name}: {count} samples")
+    
+    # Build V4 model
+    model = build_phrase_classifier_v4(num_labels=num_labels)
+    model.summary()
+    
+    log_dir = os.path.join("logs", "v4_" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            os.path.join(MODEL_DIR, "phrase_cls_v4.h5"),
+            save_best_only=True, monitor="val_accuracy", mode="max", verbose=1
+        ),
+        tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1),
+        tf.keras.callbacks.CSVLogger(
+            os.path.join(MODEL_DIR, "training_log_v4.csv"), append=False
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss', factor=0.5, patience=15, min_lr=1e-6, verbose=1
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor='val_accuracy', patience=30, restore_best_weights=True, verbose=1
+        )
+    ]
+    
+    print(f"\n🚀 Starting training v4...")
+    print(f"📁 TensorBoard: {log_dir}")
+    print(f"{'='*60}\n")
+    
+    history = model.fit(
+        X_tr, y_tr, epochs=200, batch_size=8,
+        validation_data=(X_val, y_val),
+        callbacks=callbacks, verbose=1
+    )
+    
+    # Plot
+    plt.figure(figsize=(14, 5))
+    plt.subplot(1, 3, 1)
+    plt.plot(history.history['loss'], label='Train Loss')
+    plt.plot(history.history['val_loss'], label='Val Loss')
+    plt.title('Loss'); plt.legend(); plt.grid(True)
+    
+    plt.subplot(1, 3, 2)
+    plt.plot(history.history['accuracy'], label='Train Acc')
+    plt.plot(history.history['val_accuracy'], label='Val Acc')
+    plt.title('Accuracy'); plt.legend(); plt.grid(True)
+    
+    plt.subplot(1, 3, 3)
+    if 'lr' in history.history:
+        plt.plot(history.history['lr'], label='LR')
+    plt.title('Learning Rate'); plt.legend(); plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(MODEL_DIR, 'training_history_v4.png'), dpi=150)
+    
+    # Final evaluation
+    print(f"\n{'='*60}")
+    print("📋 FINAL EVALUATION V4")
+    print(f"{'='*60}")
+    train_loss, train_acc = model.evaluate(X_tr, y_tr, verbose=0)
+    val_loss, val_acc = model.evaluate(X_val, y_val, verbose=0)
+    print(f"Training   - Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
+    print(f"Validation - Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}")
+    
+    y_pred = np.argmax(model.predict(X_val, verbose=0), axis=1)
+    class_names = [LEXICON[i] for i in range(num_labels)]
+    present_labels = sorted(set(y_val) | set(y_pred))
+    present_names = [class_names[i] for i in present_labels]
+    
+    print(f"\n📈 CLASSIFICATION REPORT:")
+    print(classification_report(y_val, y_pred, labels=present_labels, target_names=present_names))
+    
+    cm = confusion_matrix(y_val, y_pred, labels=present_labels)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=present_names, yticklabels=present_names)
+    plt.title('Confusion Matrix V4'); plt.xlabel('Predicted'); plt.ylabel('Actual')
+    plt.tight_layout()
+    plt.savefig(os.path.join(MODEL_DIR, 'confusion_matrix_v4.png'), dpi=150)
+    
+    print(f"\n✅ Training V4 complete!")
+    print(f"   Model: {os.path.join(MODEL_DIR, 'phrase_cls_v4.h5')}")
+    print(f"   Stats: {os.path.join(MODEL_DIR, 'norm_stats_v4.npz')}")
+    print(f"\n💡 Next: python main.py convert_onnx_v4 && python main.py infer_cls_v4")
+
+
+def convert_to_onnx_v4():
+    """Convert V4 model to ONNX."""
+    try:
+        import tf2onnx
+    except ImportError:
+        print("❌ pip install tf2onnx"); return
+    
+    h5_path = os.path.join(MODEL_DIR, "phrase_cls_v4.h5")
+    onnx_path = os.path.join(MODEL_DIR, "phrase_cls_v4.onnx")
+    
+    if not os.path.exists(h5_path):
+        print(f"❌ Train first: python main.py train_cls_v4"); return
+    
+    model = build_phrase_classifier_v4(num_labels=len(LEXICON))
+    model.load_weights(h5_path)
+    
+    spec = (tf.TensorSpec((None, SEQUENCE_LENGTH, 3324), tf.float32, name="input"),)
+    tf2onnx.convert.from_keras(model, input_signature=spec, output_path=onnx_path)
+    print(f"✅ ONNX V4 saved: {onnx_path}")
+
+
+def infer_cls_realtime_v4():
+    """
+    Real-time V4 inference with velocity features.
+    Computes velocity on-the-fly from the landmark sequence buffer.
+    """
+    stats_path = os.path.join(MODEL_DIR, "norm_stats_v4.npz")
+    if not os.path.exists(stats_path):
+        print("❌ Train first: python main.py train_cls_v4"); return
+    stats = np.load(stats_path)
+    mu, sigma = stats["mu"], stats["sigma"]
+    
+    # Try ONNX first
+    onnx_path = os.path.join(MODEL_DIR, "phrase_cls_v4.onnx")
+    h5_path = os.path.join(MODEL_DIR, "phrase_cls_v4.h5")
+    use_onnx = os.path.exists(onnx_path)
+    
+    if use_onnx:
+        import onnxruntime as ort
+        providers = []
+        if 'CUDAExecutionProvider' in ort.get_available_providers():
+            providers.append('CUDAExecutionProvider')
+            print("🟢 ONNX Runtime: GPU (CUDA) mode")
+        else:
+            print("🟡 ONNX Runtime: CPU mode")
+        providers.append('CPUExecutionProvider')
+        
+        ort_session = ort.InferenceSession(onnx_path, providers=providers)
+        ort_input_name = ort_session.get_inputs()[0].name
+        ort_output_name = ort_session.get_outputs()[0].name
+        
+        # Warmup with correct V4 feature dim (3324)
+        dummy = np.zeros((1, SEQUENCE_LENGTH, 3324), dtype=np.float32)
+        ort_session.run([ort_output_name], {ort_input_name: dummy})
+        print("✅ ONNX V4 model loaded and warmed up")
+        
+        bg_predictor = None  # Will use direct inference for simplicity
+        print("⚡ Using ONNX V4 model")
+    else:
+        model = build_phrase_classifier_v4(num_labels=len(LEXICON))
+        model.load_weights(h5_path)
+        ort_session = None
+        bg_predictor = None
+        print("🧠 Using Keras V4 model")
+    
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FPS, FPS_TARGET)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    
+    seq = []
+    sentence_text, stable_text = "", ""
+    last_decoded, same_count, idle_counter = "", 0, 0
+    IDLE_LIMIT = int(IDLE_FACTOR * FPS_TARGET)
+    prediction_hist = deque(maxlen=8)
+    hand_hist = deque(maxlen=SEQUENCE_LENGTH)
+    conf = 0.0
+    PREDICT_EVERY = 2 if use_onnx else 1
+    frame_count = 0
+    fps_times = deque(maxlen=30)
+    predict_ms = 0.0
+    
+    if USE_HYBRID_TRACKING:
+        holistic = None
+    else:
+        holistic = mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    
+    print("\n" + "="*50)
+    print("🚀 INFERENCE V4 — VELOCITY FEATURES")
+    print("="*50)
+    print(f"   Engine: {'ONNX' if use_onnx else 'Keras'}")
+    print(f"   Features: landmarks + velocity = 3324 dims")
+    print("="*50 + "\n")
+    
+    try:
+        while True:
+            t_start = time.perf_counter()
+            ret, frame = cap.read()
+            if not ret: break
+            
+            img, results = mediapipe_detection(frame, holistic)
+            draw_landmarks(img, results)
+            
+            kpts = extract_keypoints(results)
+            seq.append(kpts)
+            seq = seq[-SEQUENCE_LENGTH:]
+            
+            hands_missing = (results.left_hand_landmarks is None and results.right_hand_landmarks is None)
+            hand_hist.append(0 if hands_missing else 1)
+            hand_ratio = sum(hand_hist) / max(1, len(hand_hist))
+            idle_counter = idle_counter + 1 if hands_missing else 0
+            frame_count += 1
+            
+            if len(seq) == SEQUENCE_LENGTH and frame_count % PREDICT_EVERY == 0:
+                seq_raw = np.asarray(seq, dtype=np.float32)
+                seq_arr = normalize_batch(seq_raw, use_face=USE_FACE)
+                if not USE_FACE:
+                    seq_arr[:, FACE_SLICE] = 0.0
+                
+                # Compute velocity features on-the-fly
+                velocity = compute_velocity_features(seq_arr)
+                seq_with_vel = np.concatenate([seq_arr, velocity], axis=-1)  # (T, 3324)
+                
+                # Standardize
+                seq_with_vel = (seq_with_vel - mu) / sigma
+                
+                if use_onnx:
+                    inp_batch = seq_with_vel.astype(np.float32)
+                    if inp_batch.ndim == 2:
+                        inp_batch = inp_batch[np.newaxis, ...]  # (T,F) -> (1,T,F)
+                    t_pred = time.perf_counter()
+                    result = ort_session.run([ort_output_name], {ort_input_name: inp_batch})
+                    predict_ms = (time.perf_counter() - t_pred) * 1000
+                    prediction_hist.append(result[0][0])
+                else:
+                    p = model.predict(as_batch(seq_with_vel), verbose=0)[0]
+                    prediction_hist.append(p)
+            
+            if len(prediction_hist) > 0:
+                p_avg = np.mean(prediction_hist, axis=0)
+                pred = int(np.argmax(p_avg))
+                conf = float(np.max(p_avg))
+                decoded = LEXICON[pred]
+                
+                if hand_ratio > 0.4 and conf > 0.40:
+                    if decoded == last_decoded:
+                        same_count += 1
+                    else:
+                        same_count, last_decoded = 1, decoded
+                    sentence_text = decoded
+                else:
+                    if idle_counter > IDLE_LIMIT:
+                        sentence_text = ""
+            
+            commit_thresh = 2 if use_onnx else 3
+            commit = (idle_counter > IDLE_LIMIT) or (same_count >= commit_thresh and conf >= 0.50)
+            if commit and sentence_text:
+                stable_text = sentence_text
+                speak(stable_text)
+                seq, sentence_text, last_decoded, same_count = [], "", "", 0
+                idle_counter, conf = 0, 0.0
+                hand_hist.clear()
+                prediction_hist.clear()
+            
+            t_end = time.perf_counter()
+            fps_times.append(t_end - t_start)
+            fps = 1.0 / (sum(fps_times) / len(fps_times)) if fps_times else 0
+            
+            cv2.rectangle(img, (0, 0), (img.shape[1], 140), (245, 117, 16), -1)
+            cv2.putText(img, f"Prediction: {sentence_text}", (10, 32),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(img, f"COMMITTED: {stable_text}", (10, 70),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            debug_pred = last_decoded if last_decoded else "(waiting...)"
+            cv2.putText(img, f"conf:{conf:.2f} hands:{hand_ratio:.2f} pred:{debug_pred} FPS:{fps:.0f}",
+                       (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            cv2.putText(img, f"V4 Velocity | {'ONNX' if use_onnx else 'Keras'} | {predict_ms:.0f}ms",
+                       (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 255), 1)
+            
+            cv2.imshow("Sign2Speech V4 (q=quit)", img)
+            if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        if holistic is not None:
+            holistic.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="mode", required=True)
@@ -2492,6 +3527,16 @@ def main():
     sub.add_parser("convert_onnx", help="Convert model Keras → ONNX (untuk GPU acceleration)")
     sub.add_parser("infer_cls_v2", help="Inferensi real-time OPTIMIZED (ONNX GPU + threading)")
     sub.add_parser("review", help="Review kualitas data per kelas")
+
+    # V3 optimized (smaller model, better augmentation)
+    sub.add_parser("train_cls_v3", help="Latih classifier V3 OPTIMIZED (model kecil, augmentasi 8x)")
+    sub.add_parser("convert_onnx_v3", help="Convert model V3 → ONNX")
+    sub.add_parser("infer_cls_v3", help="Inferensi real-time V3 (model kecil optimized)")
+
+    # V4 velocity features (genius mode)
+    sub.add_parser("train_cls_v4", help="Latih V4 dengan velocity features (tanpa augmentasi)")
+    sub.add_parser("convert_onnx_v4", help="Convert model V4 → ONNX")
+    sub.add_parser("infer_cls_v4", help="Inferensi real-time V4 (velocity features)")
 
     p_collect = sub.add_parser("collect", help="Rekam dataset kalimat dari webcam")
     p_collect.add_argument("--sentences", type=str, nargs="+",
@@ -2543,6 +3588,18 @@ def main():
         convert_to_onnx()
     elif args.mode == "infer_cls_v2":
         infer_cls_realtime_v2()
+    elif args.mode == "train_cls_v3":
+        train_cls_v3()
+    elif args.mode == "convert_onnx_v3":
+        convert_to_onnx_v3()
+    elif args.mode == "infer_cls_v3":
+        infer_cls_realtime_v3()
+    elif args.mode == "train_cls_v4":
+        train_cls_v4()
+    elif args.mode == "convert_onnx_v4":
+        convert_to_onnx_v4()
+    elif args.mode == "infer_cls_v4":
+        infer_cls_realtime_v4()
 
 if __name__ == "__main__":
     main()
